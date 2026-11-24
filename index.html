@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1F5A85">
+<title>Slide Sendout</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ================= SCREEN: list of send-outs ================= -->
+<section id="screen-list" class="screen">
+  <header class="bar">
+    <img src="logo.png" alt="GoldPath" class="bar-logo">
+    <span class="bar-title">Slide Sendout</span>
+    <button class="icon-btn" id="btn-menu" aria-label="Menu">⋮</button>
+  </header>
+  <div id="menu" class="menu" hidden>
+    <button data-act="export-csv">Export all to CSV</button>
+    <button data-act="backup">Download backup</button>
+    <button data-act="restore">Restore from backup…</button>
+    <input type="file" id="restore-file" accept=".json,application/json" hidden>
+  </div>
+  <main class="content">
+    <button class="btn primary big" id="btn-new">＋ New send-out</button>
+    <div id="sendout-list"></div>
+    <p class="muted small center" id="storage-note"></p>
+  </main>
+</section>
+
+<!-- ================= SCREEN: one send-out ================= -->
+<section id="screen-edit" class="screen" hidden>
+  <header class="bar">
+    <button class="icon-btn" id="btn-back" aria-label="Back">‹</button>
+    <span class="bar-title" id="edit-title">Send-out</span>
+    <button class="icon-btn" id="btn-print" aria-label="Print">🖨</button>
+  </header>
+  <main class="content">
+    <div class="card">
+      <div class="row2">
+        <label>Send date<input type="date" id="f-date"></label>
+        <label>Doctor<input type="text" id="f-doctor" list="doctors" placeholder="Dr. …" autocomplete="off"></label>
+      </div>
+      <datalist id="doctors"></datalist>
+      <label>Notes<input type="text" id="f-notes" placeholder="optional"></label>
+    </div>
+
+    <div class="card scan-card">
+      <div class="scan-head">
+        <h2>Slides <span class="pill" id="count">0</span></h2>
+        <span class="muted small" id="cases"></span>
+      </div>
+      <div id="camera-wrap" hidden>
+        <video id="video" playsinline muted></video>
+        <div class="reticle"></div>
+        <div class="cam-tools">
+          <button class="btn small ghost-dark" id="btn-snap" title="Take a full-resolution photo and read it">📸 Photo</button>
+          <button class="btn small ghost-dark" id="btn-torch" hidden>💡 Light</button>
+          <button class="btn small ghost-dark" id="btn-cam-stop">Done</button>
+        </div>
+      </div>
+      <div id="cam-extra" hidden>
+        <label id="zoom-wrap" hidden>Zoom <span id="zoom-val"></span>
+          <input type="range" id="zoom" min="1" max="5" step="0.1">
+        </label>
+        <p class="muted small cam-tip">Fill the yellow square with the slide's barcode. If it won't read, zoom in and back the phone off until it's sharp, or tap 📸 Photo.</p>
+        <p class="muted small" id="cam-diag"></p>
+      </div>
+      <div class="scan-actions">
+        <button class="btn primary" id="btn-camera">📷 Scan with camera</button>
+      </div>
+      <form id="scan-form" class="scan-form" autocomplete="off">
+        <input type="text" id="scan-input" inputmode="none" placeholder="Scanner input"
+               autocapitalize="characters" spellcheck="false">
+        <button type="button" class="btn small" id="btn-keyboard" title="Type manually">⌨</button>
+        <button type="submit" class="btn small">Add</button>
+      </form>
+      <div class="ctrl-actions">
+        <button class="btn small" data-ctrl="+">＋ Ctrl</button>
+        <button class="btn small" data-ctrl="-">－ Ctrl</button>
+      </div>
+      <ol id="slide-list" class="slide-list"></ol>
+    </div>
+
+    <details class="card" id="ship-card">
+      <summary><h2>Shipping record</h2> <span class="muted small">optional</span></summary>
+      <p class="muted small" style="margin:0 0 6px">Anything left empty prints as a blank line to fill in by hand.</p>
+      <label>Sent by<input type="text" id="f-sentby" autocomplete="off"></label>
+      <label>Method
+        <select id="f-method">
+          <option value="">— choose —</option>
+          <option>Courier</option><option>FedEx</option><option>UPS</option>
+          <option>USPS</option><option>Hand Delivered</option><option>Other</option>
+        </select>
+      </label>
+      <label id="other-wrap" hidden>Other method<input type="text" id="f-method-other"></label>
+      <label>Tracking # / Courier name<input type="text" id="f-tracking" autocomplete="off"></label>
+      <label>Date / Time sent<input type="text" id="f-senttime" placeholder="e.g. 11/23 2:15 PM"></label>
+    </details>
+
+    <button class="btn primary big" id="btn-print2">🖨 Print / Save PDF</button>
+    <button class="btn danger-text" id="btn-delete">Delete this send-out</button>
+  </main>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+
+<!-- ================= PRINT LAYOUT (only visible when printing) ================= -->
+<div id="report" class="report"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
