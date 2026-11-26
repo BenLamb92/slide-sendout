@@ -256,9 +256,14 @@
   // Both run on a cropped, enlarged copy of the yellow square, not the whole frame.
   let stream = null, detector = null, scanning = false, lastCode = "", lastAt = 0;
   let zx = null, zxLoading = null, frames = 0, lastErr = "";
-  const ZX_OPTS = { formats: ["DataMatrix", "QRCode", "Code128", "Code39", "MicroQRCode"], tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, tryDenoise: true, maxNumberOfSymbols: 1 };
+  const ZX_FORMATS = ["DataMatrix", "QRCode", "MicroQRCode", "Code128", "Code39", "Code93", "Aztec", "PDF417"];
+  const ZX_BASE = { formats: ZX_FORMATS, tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, tryDenoise: true, maxNumberOfSymbols: 1, returnErrors: true };
   const roiCanvas = document.createElement("canvas");
   const roiCtx = roiCanvas.getContext("2d", { willReadFrequently: true });
+  const bgCanvas = document.createElement("canvas");
+  const bgCtx = bgCanvas.getContext("2d", { willReadFrequently: true });
+  const smallCanvas = document.createElement("canvas");
+  const smallCtx = smallCanvas.getContext("2d");
 
   function loadZXing() {
     if (zx) return Promise.resolve(zx);
@@ -284,7 +289,7 @@
     try {
       if ("BarcodeDetector" in window) {
         const fmts = await BarcodeDetector.getSupportedFormats();
-        const want = ["data_matrix", "qr_code", "code_128", "code_39"].filter((f) => fmts.includes(f));
+        const want = ["data_matrix", "qr_code", "code_128", "code_39", "code_93", "aztec", "pdf417"].filter((f) => fmts.includes(f));
         detector = want.length ? new BarcodeDetector({ formats: want }) : null;
       }
       stream = await navigator.mediaDevices.getUserMedia({
@@ -301,6 +306,7 @@
     $("#camera-wrap").hidden = false;
     $("#cam-extra").hidden = false;
     $("#btn-camera").hidden = true;
+    $("#btn-save-photo").hidden = true;
 
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
@@ -331,8 +337,8 @@
   }
   $("#zoom").addEventListener("input", (e) => setZoom(+e.target.value));
 
-  // Copy the part of the video under the yellow square (plus a margin) to a canvas, enlarged.
-  function grabROI(video) {
+  // Copy the part of the video under the yellow square (times `margin`) to a canvas, enlarged.
+  function grabROI(video, margin) {
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return null;
     const box = video.getBoundingClientRect(), ret = document.querySelector(".reticle").getBoundingClientRect();
@@ -340,7 +346,7 @@
     const offX = (vw * scale - box.width) / 2, offY = (vh * scale - box.height) / 2;
     const cx = (ret.left + ret.width / 2 - box.left + offX) / scale;
     const cy = (ret.top + ret.height / 2 - box.top + offY) / scale;
-    const side = Math.min(vw, vh, (ret.width / scale) * 1.25);         // 25% margin around the square
+    const side = Math.min(vw, vh, (ret.width / scale) * margin);
     const sx = Math.max(0, Math.min(vw - side, cx - side / 2)), sy = Math.max(0, Math.min(vh - side, cy - side / 2));
     const out = Math.max(640, Math.min(1280, Math.round(side * 1.5))); // enlarge small crops
     roiCanvas.width = roiCanvas.height = out;
@@ -349,21 +355,106 @@
     return { canvas: roiCanvas, w: vw, h: vh, side: Math.round(side) };
   }
 
-  async function decodeCanvas(canvas, useNative) {
+  // ---- image clean-up recipes (each returns a new grey ImageData) ----
+  const luma = (d, i) => (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+  // stretch the 1st..99th percentile of v[] (range -256..255) to 0..255
+  function stretchInto(v, out) {
+    const hist = new Uint32Array(512);
+    for (let i = 0; i < v.length; i++) hist[v[i] + 256]++;
+    const n = v.length, loT = n * 0.01, hiT = n * 0.99;
+    let acc = 0, lo = 0, hi = 511;
+    for (let k = 0; k < 512; k++) { acc += hist[k]; if (acc >= loT) { lo = k; break; } }
+    acc = 0;
+    for (let k = 0; k < 512; k++) { acc += hist[k]; if (acc >= hiT) { hi = k; break; } }
+    const span = Math.max(1, hi - lo), d = out.data;
+    for (let i = 0, j = 0; i < v.length; i++, j += 4) {
+      let g = ((v[i] + 256 - lo) * 255) / span;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      d[j] = d[j + 1] = d[j + 2] = g; d[j + 3] = 255;
+    }
+    return out;
+  }
+  // plain contrast stretch: faint / washed-out printing
+  function vStretch(img) {
+    const s = img.data, v = new Int16Array(img.width * img.height);
+    for (let i = 0, j = 0; i < v.length; i++, j += 4) v[i] = luma(s, j);
+    return stretchInto(v, new ImageData(img.width, img.height));
+  }
+  // subtract a heavily blurred copy: removes glare / shadow gradients across the label
+  function vFlatten(canvas, img) {
+    const w = canvas.width, h = canvas.height;
+    smallCanvas.width = Math.max(8, Math.round(w / 20)); smallCanvas.height = Math.max(8, Math.round(h / 20));
+    smallCtx.imageSmoothingEnabled = true; smallCtx.imageSmoothingQuality = "high";
+    smallCtx.drawImage(canvas, 0, 0, smallCanvas.width, smallCanvas.height);
+    bgCanvas.width = w; bgCanvas.height = h;
+    bgCtx.imageSmoothingEnabled = true; bgCtx.imageSmoothingQuality = "high";
+    bgCtx.drawImage(smallCanvas, 0, 0, w, h);
+    const b = bgCtx.getImageData(0, 0, w, h).data, s = img.data, v = new Int16Array(w * h);
+    for (let i = 0, j = 0; i < v.length; i++, j += 4) v[i] = luma(s, j) - luma(b, j);
+    return stretchInto(v, new ImageData(w, h));
+  }
+  // unsharp mask: slightly soft focus
+  function vSharpen(img) {
+    const w = img.width, h = img.height, s = img.data, g = new Uint8ClampedArray(w * h);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = luma(s, j);
+    const v = new Int16Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) { v[i] = g[i]; continue; }
+      const val = 5 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
+      v[i] = val < -255 ? -255 : val > 255 ? 255 : val;
+    }
+    return stretchInto(v, new ImageData(w, h));
+  }
+
+  // stronger unsharp mask at roughly module scale: out-of-focus labels (r = blur radius in px)
+  function vDeblur(canvas, img, r, amount) {
+    const w = canvas.width, h = canvas.height;
+    bgCanvas.width = w; bgCanvas.height = h;
+    bgCtx.filter = `blur(${r}px)`; bgCtx.drawImage(canvas, 0, 0); bgCtx.filter = "none";
+    const b = bgCtx.getImageData(0, 0, w, h).data, s = img.data, v = new Int16Array(w * h);
+    for (let i = 0, j = 0; i < v.length; i++, j += 4) {
+      const g = luma(s, j), val = g + amount * (g - luma(b, j));
+      v[i] = val < -256 ? -256 : val > 255 ? 255 : val;
+    }
+    return stretchInto(v, new ImageData(w, h));
+  }
+
+  let lastSeen = ""; // e.g. "DataMatrix seen but not readable (ChecksumError)"
+  async function zxRead(img, binarizer) {
+    const r = await zx.readBarcodes(img, { ...ZX_BASE, binarizer });
+    const ok = r.find((x) => x.isValid && x.text);
+    if (ok) return ok.text;
+    const bad = r.find((x) => x.format && x.format !== "None");
+    if (bad) lastSeen = `${bad.format} seen but not readable${bad.error ? " (" + String(bad.error).split(/[\s:]/)[0] + ")" : ""}`;
+    return null;
+  }
+
+  // passes = list of [recipe, binarizer]; recipe: raw | stretch | flatten | sharpen
+  async function decodeCanvas(canvas, useNative, passes) {
     if (useNative && detector) {
       try {
         const r = await detector.detect(canvas);
         if (r.length && r[0].rawValue) return { text: r[0].rawValue, by: "chrome" };
       } catch (e) { lastErr = "chrome: " + e.message; }
     }
-    if (zx) {
-      try {
-        const img = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height);
-        const r = await zx.readBarcodes(img, ZX_OPTS);
-        const ok = r.find((x) => x.isValid && x.text);
-        if (ok) return { text: ok.text, by: "zxing" };
-      } catch (e) { lastErr = "zxing: " + e.message; }
-    }
+    if (!zx) return null;
+    try {
+      const raw = canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, canvas.width, canvas.height);
+      const cache = { raw };
+      const make = (v) => {
+        if (v === "stretch") return vStretch(raw);
+        if (v === "flatten") return vFlatten(canvas, raw);
+        if (v === "sharpen") return vSharpen(raw);
+        const m = /^deblur(\d+)$/.exec(v); // deblurN: radius = canvas width / N
+        return vDeblur(canvas, raw, Math.max(2, canvas.width / +m[1]), 2.5);
+      };
+      const get = (v) => cache[v] || (cache[v] = make(v));
+      for (const [v, bin] of passes) {
+        const t = await zxRead(get(v), bin);
+        if (t) return { text: t, by: "zxing" + (v === "raw" ? "" : "-" + v) };
+      }
+    } catch (e) { lastErr = "zxing: " + e.message; }
     return null;
   }
 
@@ -375,31 +466,55 @@
     if (addBarcode(val, "camera-" + by)) {
       const r = document.querySelector(".reticle"); r.classList.add("hit");
       setTimeout(() => r.classList.remove("hit"), 350);
+      $("#btn-save-photo").hidden = true;
     }
   }
 
+  // Each video frame tries one recipe; the cycle covers glare, faint print, soft focus and framing.
+  const LIVE_PASSES = [
+    { margin: 1.25, native: true,  passes: [["raw", "LocalAverage"]] },
+    { margin: 1.25, native: false, passes: [["flatten", "LocalAverage"]] },
+    { margin: 0.9,  native: true,  passes: [["raw", "GlobalHistogram"]] },
+    { margin: 1.25, native: false, passes: [["stretch", "GlobalHistogram"]] },
+    { margin: 0.9,  native: false, passes: [["flatten", "GlobalHistogram"]] },
+    { margin: 1.6,  native: true,  passes: [["sharpen", "LocalAverage"]] },
+    { margin: 1.25, native: false, passes: [["deblur100", "LocalAverage"]] },
+    { margin: 0.9,  native: false, passes: [["deblur60", "GlobalHistogram"]] },
+  ];
   async function scanLoop() {
     const video = $("#video");
     while (scanning) {
       if (video.readyState >= 2) {
-        const roi = grabROI(video);
+        const p = LIVE_PASSES[frames % LIVE_PASSES.length];
+        const roi = grabROI(video, p.margin);
         if (roi) {
           frames++;
-          const hit = await decodeCanvas(roi.canvas, true);
-          if (hit) onDecoded(hit.text, hit.by);
-          if (frames % 10 === 1) {
-            $("#cam-diag").textContent = `${roi.w}×${roi.h} · crop ${roi.side}px · ${detector ? "chrome+" : ""}${zx ? "zxing" : "zxing loading…"}${lastErr ? " · " + lastErr : ""}`;
+          const hit = await decodeCanvas(roi.canvas, p.native, p.passes);
+          if (hit) { onDecoded(hit.text, hit.by); lastSeen = ""; }
+          if (frames % 12 === 1) {
+            $("#cam-diag").textContent = `${roi.w}×${roi.h} · crop ${roi.side}px · ${detector ? "chrome+" : ""}${zx ? "zxing" : "zxing loading…"}${lastSeen ? " · " + lastSeen : ""}${lastErr ? " · " + lastErr : ""}`;
+            lastSeen = "";
           }
         }
       }
-      await new Promise((r) => setTimeout(r, 60));
+      await new Promise((r) => setTimeout(r, 40));
     }
   }
 
-  // Full-resolution still photo: far more pixels on the label than the video stream.
+  // Full-resolution still photo: far more pixels on the label than the video stream,
+  // and every clean-up recipe is tried on several crop sizes.
+  const PHOTO_PASSES = [
+    ["raw", "LocalAverage"], ["flatten", "LocalAverage"], ["raw", "GlobalHistogram"],
+    ["stretch", "GlobalHistogram"], ["flatten", "GlobalHistogram"], ["sharpen", "LocalAverage"],
+    ["stretch", "LocalAverage"], ["sharpen", "GlobalHistogram"],
+    ["deblur120", "LocalAverage"], ["deblur120", "GlobalHistogram"], ["deblur60", "LocalAverage"], ["deblur60", "GlobalHistogram"],
+  ];
+  let lastPhoto = null;
   $("#btn-snap").addEventListener("click", async () => {
     const t = stream && stream.getVideoTracks()[0]; if (!t) return;
     const btn = $("#btn-snap"); btn.disabled = true; btn.textContent = "Reading…";
+    $("#btn-save-photo").hidden = true;
+    lastSeen = "";
     try {
       await loadZXing();
       let bmp;
@@ -407,27 +522,56 @@
         try { bmp = await createImageBitmap(await new ImageCapture(t).takePhoto()); } catch { /* fall back to a video frame */ }
       }
       if (!bmp) bmp = await createImageBitmap($("#video"));
-      // try the centre third (where the square is) enlarged, then the centre half, then the whole photo
-      const tries = [0.34, 0.5, 1];
-      let hit = null;
-      for (const f of tries) {
-        const side = Math.min(bmp.width, bmp.height) * f;
-        const sx = (bmp.width - side) / 2, sy = (bmp.height - side) / 2;
-        const c = document.createElement("canvas");
-        const out = Math.min(1600, Math.max(800, Math.round(side)));
-        c.width = c.height = out;
-        c.getContext("2d").drawImage(bmp, sx, sy, side, side, 0, 0, out, out);
-        hit = await decodeCanvas(c, true);
-        if (hit) break;
-      }
-      $("#cam-diag").textContent = `photo ${bmp.width}×${bmp.height} · ${hit ? "read by " + hit.by : "no barcode found"}`;
+      const hit = await decodePhoto(bmp);
+      $("#cam-diag").textContent = `photo ${bmp.width}×${bmp.height} · ${hit ? "read by " + hit.by : lastSeen || "no barcode found"}`;
       if (hit) onDecoded(hit.text, hit.by + "-photo");
-      else { beep(false); toast("No barcode found in the photo — try zooming in so the label fills the square.", "warn"); }
+      else {
+        beep(false);
+        // keep the photo so it can be saved and sent to IT for a look
+        const full = document.createElement("canvas");
+        full.width = bmp.width; full.height = bmp.height;
+        full.getContext("2d").drawImage(bmp, 0, 0);
+        lastPhoto = full;
+        $("#btn-save-photo").hidden = false;
+        toast(lastSeen
+          ? "Barcode found but damaged or blurry. Tilt the slide to remove glare and try again, or type it with ⌨."
+          : "No barcode found. Zoom in so the label fills the square, or type it with ⌨.", "warn");
+      }
     } catch (e) {
       toast("Photo failed: " + e.message, "warn");
     } finally {
       btn.disabled = false; btn.textContent = "📸 Photo";
     }
+  });
+  // centre crops (the square is in the middle), smallest first, each resized to a workable size
+  async function decodePhoto(bmp) {
+    const tries = [[0.25, 900], [0.34, 1000], [0.5, 1200], [0.34, 600], [0.7, 1400], [1, 1600]];
+    for (const [f, size] of tries) {
+      const side = Math.min(bmp.width, bmp.height) * f;
+      const sx = (bmp.width - side) / 2, sy = (bmp.height - side) / 2;
+      const c = document.createElement("canvas");
+      const out = Math.min(size, Math.max(500, Math.round(side * 2)));
+      c.width = c.height = out;
+      const cx = c.getContext("2d", { willReadFrequently: true });
+      cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high";
+      cx.drawImage(bmp, sx, sy, side, side, 0, 0, out, out);
+      const hit = await decodeCanvas(c, true, PHOTO_PASSES);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  window.__decodePhoto = decodePhoto; // used by the automated tests
+  window.__loadZXing = loadZXing;
+  $("#btn-save-photo").addEventListener("click", () => {
+    if (!lastPhoto) return;
+    lastPhoto.toBlob((b) => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(b);
+      a.download = `unreadable-label-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.jpg`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      toast("Photo saved to Downloads.", "ok");
+    }, "image/jpeg", 0.92);
   });
 
   function stopCamera() {
