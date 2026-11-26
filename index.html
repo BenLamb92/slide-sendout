@@ -59,6 +59,7 @@
         <div class="reticle"></div>
         <div class="cam-tools">
           <button class="btn small ghost-dark" id="btn-snap" title="Take a full-resolution photo and read it">📸 Photo</button>
+          <button class="btn small ghost-dark" id="btn-ocr" title="Read the printed case / block / slide text instead of the barcode">🔤 Text</button>
           <button class="btn small ghost-dark" id="btn-torch" hidden>💡 Light</button>
           <button class="btn small ghost-dark" id="btn-cam-stop">Done</button>
         </div>
@@ -67,7 +68,7 @@
         <label id="zoom-wrap" hidden>Zoom <span id="zoom-val"></span>
           <input type="range" id="zoom" min="1" max="5" step="0.1">
         </label>
-        <p class="muted small cam-tip">Fill the yellow square with the slide's barcode. If it won't read: zoom in and back the phone off until it's sharp, tilt the slide so there's no glare on the label, or tap 📸 Photo.</p>
+        <p class="muted small cam-tip">Fill the yellow square with the slide's barcode. If it won't read: zoom in and back the phone off until it's sharp, tilt the slide so there's no glare on the label, or tap 📸 Photo. For a damaged barcode, tap 🔤 Text with the whole label in view to read the printed case / block / slide number.</p>
         <p class="muted small" id="cam-diag"></p>
         <button type="button" class="btn small" id="btn-save-photo" hidden>💾 Save this photo (to send to IT)</button>
       </div>

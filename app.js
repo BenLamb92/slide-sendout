@@ -510,37 +510,170 @@
     ["deblur120", "LocalAverage"], ["deblur120", "GlobalHistogram"], ["deblur60", "LocalAverage"], ["deblur60", "GlobalHistogram"],
   ];
   let lastPhoto = null;
+  async function takePhoto() {
+    const t = stream && stream.getVideoTracks()[0]; if (!t) return null;
+    let bmp;
+    if ("ImageCapture" in window) {
+      try { bmp = await createImageBitmap(await new ImageCapture(t).takePhoto()); } catch { /* fall back to a video frame */ }
+    }
+    return bmp || createImageBitmap($("#video"));
+  }
+  function keepPhoto(bmp) {
+    const full = document.createElement("canvas");
+    full.width = bmp.width; full.height = bmp.height;
+    full.getContext("2d").drawImage(bmp, 0, 0);
+    lastPhoto = full;
+    $("#btn-save-photo").hidden = false;
+  }
   $("#btn-snap").addEventListener("click", async () => {
-    const t = stream && stream.getVideoTracks()[0]; if (!t) return;
+    if (!stream) return;
     const btn = $("#btn-snap"); btn.disabled = true; btn.textContent = "Reading…";
     $("#btn-save-photo").hidden = true;
     lastSeen = "";
     try {
       await loadZXing();
-      let bmp;
-      if ("ImageCapture" in window) {
-        try { bmp = await createImageBitmap(await new ImageCapture(t).takePhoto()); } catch { /* fall back to a video frame */ }
-      }
-      if (!bmp) bmp = await createImageBitmap($("#video"));
+      const bmp = await takePhoto();
       const hit = await decodePhoto(bmp);
       $("#cam-diag").textContent = `photo ${bmp.width}×${bmp.height} · ${hit ? "read by " + hit.by : lastSeen || "no barcode found"}`;
       if (hit) onDecoded(hit.text, hit.by + "-photo");
       else {
         beep(false);
-        // keep the photo so it can be saved and sent to IT for a look
-        const full = document.createElement("canvas");
-        full.width = bmp.width; full.height = bmp.height;
-        full.getContext("2d").drawImage(bmp, 0, 0);
-        lastPhoto = full;
-        $("#btn-save-photo").hidden = false;
-        toast(lastSeen
-          ? "Barcode found but damaged or blurry. Tilt the slide to remove glare and try again, or type it with ⌨."
-          : "No barcode found. Zoom in so the label fills the square, or type it with ⌨.", "warn");
+        keepPhoto(bmp);
+        // barcode is unreadable: fall back to reading the printed text on the same photo
+        toast(lastSeen ? "Barcode is damaged — reading the printed text instead…" : "No barcode found — reading the printed text instead…", "warn");
+        btn.textContent = "Reading text…";
+        await ocrAndConfirm(bmp);
       }
     } catch (e) {
       toast("Photo failed: " + e.message, "warn");
     } finally {
       btn.disabled = false; btn.textContent = "📸 Photo";
+    }
+  });
+
+  // ---- OCR fallback: read the case / block / slide text printed on the label (Tesseract, on the phone) ----
+  let ocrWorker = null, ocrLoading = null;
+  function loadScript(src) {
+    return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("could not load " + src)); document.head.appendChild(s); });
+  }
+  function loadOCR() {
+    if (ocrWorker) return Promise.resolve(ocrWorker);
+    if (ocrLoading) return ocrLoading;
+    const dir = new URL("vendor/ocr/", location.href).href;
+    ocrLoading = (async () => {
+      if (!window.Tesseract) await loadScript("vendor/ocr/tesseract.min.js");
+      ocrWorker = await Tesseract.createWorker("eng", 1, {
+        workerPath: dir + "worker.min.js", corePath: dir, langPath: dir.replace(/\/$/, ""), workerBlobURL: false,
+      });
+      return ocrWorker;
+    })().catch((e) => { ocrLoading = null; throw e; });
+    return ocrLoading;
+  }
+  // OCR look-alikes inside places that must be digits
+  const toDigits = (s) => s.replace(/[OQDU]/g, "0").replace(/[IL|!\]\[]/g, "1").replace(/Z/g, "2").replace(/S/g, "5").replace(/B/g, "8").replace(/G/g, "6").replace(/T/g, "7");
+  // Label text "EN26-00268 / B2.S1" -> barcode "EN26-00268-B-2-1"
+  function parseLabelText(text) {
+    const t = text.toUpperCase().replace(/[–—~_]/g, "-");
+    const D = "[0-9OQDUIL|SZBGT]";
+    let caseNo = null;
+    const cm = new RegExp(String.raw`\b([A-Z]{1,4}?)\s?(${D}{2})\s?-\s?(${D}{4,6})\b`).exec(t);
+    if (cm) caseNo = `${cm[1]}${toDigits(cm[2])}-${toDigits(cm[3])}`;
+    let part = null;
+    // part letter + block, then S + slide:  B2.S1  B2,S1  B2 S1  (S often read as 5)
+    const pm = new RegExp(String.raw`(?:^|\s)([A-Z])\s?(${D}{1,2})\s?[.,·:;]?\s?[S5$]\s?(${D}{1,2})(?=\s|$)`, "m").exec(t.replace(cm ? cm[0] : "\u0000", " "));
+    if (pm) part = `${pm[1]}-${+toDigits(pm[2])}-${+toDigits(pm[3])}`;
+    return { caseNo, part, code: caseNo && part ? `${caseNo}-${part}` : null };
+  }
+  window.__parseLabelText = parseLabelText; // used by the automated tests
+  // draw (part of) a bitmap scaled, optionally softened (fills the speckle in thermal print), contrast-stretched
+  function ocrCanvas(bmp, sx, sy, sw, sh, scale, soften) {
+    const c = document.createElement("canvas");
+    c.width = Math.max(16, Math.round(sw * scale)); c.height = Math.max(16, Math.round(sh * scale));
+    const cx = c.getContext("2d", { willReadFrequently: true });
+    cx.fillStyle = "#fff"; cx.fillRect(0, 0, c.width, c.height);
+    cx.imageSmoothingQuality = "high";
+    if (soften) cx.filter = `blur(${soften}px)`;
+    cx.drawImage(bmp, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    cx.filter = "none";
+    cx.putImageData(vStretch(cx.getImageData(0, 0, c.width, c.height)), 0, 0);
+    return c;
+  }
+  async function ocrRun(canvas, psm) {
+    const w = await loadOCR();
+    await w.setParameters({ tessedit_pageseg_mode: String(psm) });
+    const { data } = await w.recognize(canvas, {}, { text: true, blocks: true });
+    const words = [];
+    for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const wd of l.words || []) words.push(wd);
+    return { text: data.text || "", words };
+  }
+  // 1) find the case number on the whole photo (a few scales / page modes),
+  // 2) OCR just the strip under it (left of the barcode) for the block/slide line, sized for Tesseract.
+  async function ocrLabel(bmp) {
+    const CASE = new RegExp(String.raw`([A-Z]{1,4})\s?([0-9OQDUIL|SZBGT]{2})\s?-\s?([0-9OQDUIL|SZBGT]{4,6})`);
+    const tries = [[1000, 11, true], [1400, 11, true], [700, 3, false], [2000, 11, true], [500, 3, false]];
+    const votes = {}; let best = null, anyText = "";
+    for (const [width, psm, soft] of tries) {
+      const scale = Math.min(width, bmp.width * 1.5) / bmp.width;
+      const c = ocrCanvas(bmp, 0, 0, bmp.width, bmp.height, scale, soft ? Math.max(1, width / 600) : 0);
+      const r = await ocrRun(c, psm);
+      anyText += r.text + "\n";
+      const p = parseLabelText(r.text);
+      if (p.code) votes[p.code] = (votes[p.code] || 0) + 1;
+      if (!p.caseNo) continue;
+      const wd = r.words.find((w) => CASE.test(w.text.toUpperCase().replace(/[–—~_]/g, "-")));
+      if (!wd) { best = best || { p }; continue; }
+      const bb = wd.bbox, h = (bb.y1 - bb.y0) / scale, x0 = bb.x0 / scale, x1 = bb.x1 / scale, y1 = bb.y1 / scale;
+      best = { p, h, x0, x1, y1 };
+      break;
+    }
+    if (!best) return { caseNo: null, part: null, code: null, text: anyText };
+    const caseNo = best.p.caseNo;
+    let part = best.p.part;
+    if (best.h) {
+      // strip below the case number: same left edge, as wide as the case number, ~2.8 lines tall
+      const partVotes = {};
+      // [left margin, height in lines, cap height px, page mode, soften]
+      const strips = [[0.6, 2.8, 44, 6, 1.2], [0.6, 2.8, 44, 6, 0], [1.2, 1.6, 40, 6, 1.2], [1.2, 3.2, 52, 11, 1.5], [1.2, 1.6, 36, 7, 1], [0.8, 2.2, 60, 6, 2]];
+      for (const [mx, lines, cap, psm, soft] of strips) {
+        const sx = Math.max(0, best.x0 - best.h * mx), sy = Math.max(0, best.y1 - best.h * 0.1);
+        const sw = Math.min(bmp.width - sx, best.x1 - best.x0 + best.h * (mx + 0.2)), sh = Math.min(bmp.height - sy, best.h * lines);
+        const r = await ocrRun(ocrCanvas(bmp, sx, sy, sw, sh, cap / best.h, soft), psm);
+        const pp = parseLabelText(r.text).part;
+        if (pp) { partVotes[pp] = (partVotes[pp] || 0) + 1; if (partVotes[pp] >= 2) break; }
+      }
+      const top = Object.entries(partVotes).sort((a, b) => b[1] - a[1])[0];
+      if (top) part = top[0];
+    }
+    await (await loadOCR()).setParameters({ tessedit_pageseg_mode: "3" });
+    return { caseNo, part, code: part ? `${caseNo}-${part}` : null, text: anyText };
+  }
+  window.__ocrLabel = ocrLabel;
+  window.__loadOCR = loadOCR;
+  async function ocrAndConfirm(bmp) {
+    let r;
+    try { r = await ocrLabel(bmp); }
+    catch (e) { toast("Text reading failed: " + e.message, "warn"); return; }
+    $("#cam-diag").textContent = `text: ${r.caseNo || "no case #"} · ${r.part || "no block/slide"}`;
+    if (!r.caseNo) {
+      toast("Couldn't find the case number. Zoom out so the whole label is in view and tap 🔤 Text, or type it with ⌨.", "warn");
+      return;
+    }
+    const guess = r.code || r.caseNo + "-";
+    const v = prompt(`Read from the label text${r.code ? "" : " (block/slide not found — please finish it)"}.\nCheck it against the label, then OK to add:`, guess);
+    if (v && v.trim()) onDecoded(v.trim().toUpperCase(), "ocr");
+  }
+  $("#btn-ocr").addEventListener("click", async () => {
+    if (!stream) return;
+    const btn = $("#btn-ocr"); btn.disabled = true; btn.textContent = "Reading…";
+    try {
+      loadOCR().catch(() => {});
+      const bmp = await takePhoto();
+      keepPhoto(bmp);
+      await ocrAndConfirm(bmp);
+    } catch (e) {
+      toast("Photo failed: " + e.message, "warn");
+    } finally {
+      btn.disabled = false; btn.textContent = "🔤 Text";
     }
   });
   // centre crops (the square is in the middle), smallest first, each resized to a workable size
